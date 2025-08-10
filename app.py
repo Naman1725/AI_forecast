@@ -35,23 +35,29 @@ app = Flask(__name__)
 # Helpers
 # -----------------------
 def safe_filename(s: str) -> str:
+    """Create filesystem-safe filenames"""
     return re.sub(r'[^a-zA-Z0-9_]', '', s.replace(" ", "_"))
 
 def load_excel():
+    """Download the excel file and return a pandas DataFrame"""
     try:
         logger.debug("Downloading Excel from: %s", EXCEL_URL)
         resp = requests.get(EXCEL_URL, timeout=30)
         resp.raise_for_status()
         df = pd.read_excel(BytesIO(resp.content))
+        # Immediately normalize column types to strings for consistent handling
+        df.columns = [str(c) for c in df.columns]
         logger.debug("Excel loaded, shape=%s", df.shape)
+        logger.debug("Excel columns (first 100): %s", df.columns.tolist()[:100])
         return df
     except Exception as e:
         logger.exception("Failed to download/load excel")
         raise RuntimeError(f"Failed to download/load excel: {e}")
 
 def ensure_models_unzipped():
+    """Download and extract models if MODELS_DIR doesn't exist or is empty"""
     if os.path.exists(MODELS_DIR) and os.listdir(MODELS_DIR):
-        logger.debug("Models directory already exists: %s", MODELS_DIR)
+        logger.debug("Models directory already exists and non-empty: %s", MODELS_DIR)
         return
 
     logger.info("Models directory missing or empty. Downloading models zip...")
@@ -75,16 +81,20 @@ def ensure_models_unzipped():
         with zipfile.ZipFile(MODELS_ZIP_PATH, "r") as z:
             z.extractall(temp_dir)
         entries = os.listdir(temp_dir)
-        logger.debug("Extracted entries: %s", entries)
+        logger.debug("Extracted entries from zip: %s", entries)
         candidate = None
         for e in entries:
             full = os.path.join(temp_dir, e)
             if os.path.isdir(full):
+                # prefer directory named 'models'
                 if e.lower() == "models":
                     candidate = full
                     break
                 candidate = full if candidate is None else candidate
+
+        # If zip contained files directly, candidate will be None and src=temp_dir
         src = candidate or temp_dir
+
         if os.path.exists(MODELS_DIR):
             shutil.rmtree(MODELS_DIR)
         shutil.move(src, MODELS_DIR)
@@ -93,6 +103,7 @@ def ensure_models_unzipped():
         logger.exception("Failed to extract/move models")
         raise RuntimeError(f"Failed to extract/move models: {e}")
     finally:
+        # cleanup
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
@@ -106,24 +117,25 @@ def _normalize_str(x: Optional[object]) -> str:
         return ""
     s = str(x)
     s = s.strip().lower()
-    s = re.sub(r'\s+', '', s)  # remove spaces
+    s = re.sub(r'\s+', '', s)
     s = re.sub(r'[^0-9a-z]', '', s)
     return s
 
 def detect_month_columns(columns):
     """Return list of column names that look like monthly columns.
-    Heuristic: column contains 4-digit year (e.g., 2020) OR month names."""
+
+    Heuristic: contains 4-digit year (e.g., 2020) OR starts with month name (Jan/Feb...)"""
     month_cols = []
     month_name_regex = re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', re.I)
     year_regex = re.compile(r'20\d{2}')
     for c in columns:
         cn = str(c)
-        if year_regex.search(cn) or month_name_regex.search(cn):
+        if year_regex.search(cn) or month_name_regex.search(cn) or re.search(r'\b\d{1,2}[-/]\d{4}\b', cn):
             month_cols.append(c)
     return month_cols
 
 # -----------------------
-# convert_to_long_format (inlined to avoid missing-import error)
+# convert_to_long_format (with duplicate column name handling)
 # -----------------------
 def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone: str, kpi: str) -> pd.DataFrame:
     """
@@ -134,54 +146,88 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     df = df.copy()
     logger.debug("convert_to_long_format called with df.shape=%s", df.shape)
 
-    # If already in long format, require Month + Value
+    # 1) Normalize column names to strings
+    df.columns = [str(c) for c in df.columns]
+
+    # 2) Deduplicate duplicate column labels (Month duplicates were causing issues)
+    cols = list(df.columns)
+    if any(pd.Index(cols).duplicated()):
+        logger.warning("Duplicate column labels detected before dedup: %s", cols)
+        seen = {}
+        new_cols = []
+        for c in cols:
+            name = str(c)
+            if name in seen:
+                seen[name] += 1
+                new_name = f"{name}_{seen[name]}"
+            else:
+                seen[name] = 0
+                new_name = name
+            new_cols.append(new_name)
+        df.columns = new_cols
+        logger.info("Renamed duplicate columns. New columns (first 100): %s", df.columns.tolist()[:100])
+
+    # If already in long format with Month + Value, try to filter and return
     if {"Month", "Value"}.issubset(set(df.columns)):
-        logger.debug("Input already long format. Attempting to filter.")
-        # Attempt to filter on other available metadata columns if present
-        meta_filters = {}
-        for name, val in [("Country", country), ("country", country),
-                          ("Zone", zone), ("zone", zone),
-                          ("Technology", technology), ("technology", technology),
-                          ("KPI", kpi), ("kpi", kpi)]:
-            if name in df.columns:
-                meta_filters[name] = val
+        logger.debug("Input already long format. Attempting to filter by metadata if present.")
+        # Try to detect metadata columns with common names
+        meta_cols = {c.lower(): c for c in df.columns}
+        def pick_meta(names):
+            for n in names:
+                if n.lower() in meta_cols:
+                    return meta_cols[n.lower()]
+            # fallback: find any column containing the token
+            for c in df.columns:
+                for token in names:
+                    if token.lower() in c.lower():
+                        return c
+            return None
 
-        for col, val in meta_filters.items():
-            if val is None or val == "":
-                continue
-            df = df[df[col].astype(str).apply(_normalize_str) == _normalize_str(val)]
-        result = df[["Month", "Value"]].copy()
-        result["Month"] = pd.to_datetime(result["Month"], errors="coerce")
-        result["Value"] = pd.to_numeric(result["Value"], errors="coerce")
-        result = result.dropna(subset=["Month", "Value"]).sort_values("Month")
-        logger.debug("Returning long-format result shape=%s", result.shape)
-        return result
+        country_col = pick_meta(["country", "countryname", "nation"])
+        zone_col = pick_meta(["zone", "region", "state", "area"])
+        tech_col = pick_meta(["technology", "tech", "technology_name"])
+        kpi_col = pick_meta(["kpi", "metric", "measure"])
 
-    # If columns are a MultiIndex, flatten them
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(i) for i in col if i and str(i).strip() != ""]) for col in df.columns.values]
-        logger.debug("Flattened MultiIndex columns.")
+        result = df.copy()
+        # Apply filters if the columns exist
+        if country_col:
+            result = result[result[country_col].astype(str).apply(_normalize_str) == _normalize_str(country)]
+        if zone_col:
+            result = result[result[zone_col].astype(str).apply(_normalize_str) == _normalize_str(zone)]
+        if tech_col:
+            result = result[result[tech_col].astype(str).apply(_normalize_str) == _normalize_str(technology)]
+        if kpi_col:
+            result = result[result[kpi_col].astype(str).apply(_normalize_str) == _normalize_str(kpi)]
 
-    # Detect month-like columns heuristically
+        # Convert and return
+        if "Month" in result.columns and "Value" in result.columns:
+            result["Month"] = pd.to_datetime(result["Month"], errors="coerce")
+            result["Value"] = pd.to_numeric(result["Value"], errors="coerce")
+            result = result.dropna(subset=["Month", "Value"]).sort_values("Month")
+            logger.debug("Returning long-format result shape=%s", result.shape)
+            return result[["Month", "Value"]]
+
+    # If columns are a MultiIndex or look like tuples, flatten them (they were already stringified above)
+    # Detect month-like columns
     month_cols = detect_month_columns(df.columns)
     logger.debug("Detected month columns: %s", month_cols)
 
     if not month_cols:
-        # last attempt: detect columns that look like YYYY-MM or MMM-YYYY with common separators
-        candidate = [c for c in df.columns if re.search(r'\d{4}', str(c))]
+        # fallback: columns containing any 4-digit year
+        candidate = [c for c in df.columns if re.search(r'\b20\d{2}\b', str(c))]
         if candidate:
             month_cols = candidate
-            logger.debug("Fallback month columns via any 4-digit match: %s", month_cols)
+            logger.debug("Fallback month columns via 4-digit year match: %s", month_cols)
 
     if not month_cols:
         raise ValueError(
             "Could not detect monthly columns in the Excel file. "
-            "Column names found: " + ", ".join([str(c) for c in df.columns[:50]])
+            "Column names found: " + ", ".join([str(c) for c in df.columns[:100]])
         )
 
     id_vars = [c for c in df.columns if c not in month_cols]
     if len(id_vars) == 0:
-        # If there are no id_vars, create a dummy id column so melt works
+        # create dummy id column
         df["_row_id"] = range(len(df))
         id_vars = ["_row_id"]
 
@@ -189,11 +235,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     melted = df.melt(id_vars=id_vars, value_vars=month_cols, var_name="Month", value_name="Value")
     logger.debug("Melted shape=%s", melted.shape)
 
-    # Normalize column names to find metadata columns (country/zone/etc.)
-    col_map = {c: c for c in id_vars}
-    lower_to_orig = {c.lower(): c for c in id_vars}
-
-    # find best candidates
+    # Attempt to locate metadata columns among id_vars
     def pick_column(possible_names):
         for n in possible_names:
             for c in id_vars:
@@ -206,30 +248,23 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     tech_col = pick_column(["technology", "tech", "technology_name"])
     kpi_col = pick_column(["kpi", "metric", "measure"])
 
-    # Apply filters where columns exist
-    filters = []
-    if country_col:
-        filters.append((country_col, country))
-    if zone_col:
-        filters.append((zone_col, zone))
-    if tech_col:
-        filters.append((tech_col, technology))
-    if kpi_col:
-        filters.append((kpi_col, kpi))
-
     logger.debug("Detected metadata columns => country:%s zone:%s tech:%s kpi:%s",
                  country_col, zone_col, tech_col, kpi_col)
 
-    for col, val in filters:
-        if val is None or str(val).strip() == "":
-            continue
-        melted = melted[melted[col].astype(str).apply(_normalize_str) == _normalize_str(val)]
+    # Apply filters where columns exist
+    if country_col:
+        melted = melted[melted[country_col].astype(str).apply(_normalize_str) == _normalize_str(country)]
+    if zone_col:
+        melted = melted[melted[zone_col].astype(str).apply(_normalize_str) == _normalize_str(zone)]
+    if tech_col:
+        melted = melted[melted[tech_col].astype(str).apply(_normalize_str) == _normalize_str(technology)]
+    if kpi_col:
+        melted = melted[melted[kpi_col].astype(str).apply(_normalize_str) == _normalize_str(kpi)]
 
     # Convert Month to datetime
     melted["Month_parsed"] = pd.to_datetime(melted["Month"], errors="coerce", dayfirst=False)
-    # If all NaT, try some alternative parsing (month name + year)
     if melted["Month_parsed"].isna().all():
-        # try common formats
+        # try some common formats
         def try_parse(s):
             s = str(s)
             for fmt in ("%b-%Y", "%B-%Y", "%Y-%m", "%Y/%m", "%m/%Y", "%Y"):
@@ -250,6 +285,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     return result
 
 def validate_hist_df(hist_df):
+    """Ensure hist_df contains expected columns Month (datetime) and Value (numeric)"""
     if hist_df is None or len(hist_df) == 0:
         raise ValueError("Historical dataframe is empty.")
     if "Month" not in hist_df.columns or "Value" not in hist_df.columns:
@@ -271,6 +307,7 @@ def validate_hist_df(hist_df):
 # -----------------------
 @app.route("/models", methods=["GET"])
 def list_models():
+    """List files in the models directory for debugging"""
     try:
         if not os.path.exists(MODELS_DIR):
             return jsonify({"models_dir_exists": False, "message": f"{MODELS_DIR} not found on disk"}), 200
@@ -286,6 +323,7 @@ def list_models():
 @app.route("/forecast", methods=["POST"])
 def forecast():
     try:
+        # Parse params
         country = request.form.get("country", "Benin")
         technology = request.form.get("technology", "2G")
         zone = request.form.get("zone", "Zone 1")
@@ -295,27 +333,33 @@ def forecast():
         except Exception:
             return jsonify({"error": "forecast_time must be integer"}), 400
 
+        # Load historical data
         df = load_excel()
 
-        # Convert to long format (now inlined above)
+        # Convert to long format
         try:
             hist_df = convert_to_long_format(df, country, technology, zone, kpi)
         except Exception as e:
             logger.exception("convert_to_long_format failed")
-            # return helpful error to caller
-            return jsonify({
+            payload = {
                 "error": "convert_to_long_format failed",
                 "message": str(e),
-                "hint": "Ensure your Excel has monthly columns (e.g., 'Jan-2020' or '2020-01') or a long table with 'Month' and 'Value'."
-            }), 400
+                "hint": "Ensure your Excel has monthly columns (e.g., 'Jan-2020' or '2020-01') or a long table with 'Month' and 'Value'.",
+                "detected_columns": df.columns.tolist()[:200]
+            }
+            if DEBUG:
+                payload["traceback"] = traceback.format_exc()
+            return jsonify(payload), 400
 
+        # Validate
         hist_df = validate_hist_df(hist_df)
-
         if hist_df.empty:
             return jsonify({"error": "No historical data found for the given parameters"}), 404
 
+        # Ensure models available
         ensure_models_unzipped()
 
+        # Build model filename and load
         model_name = f"{country} {zone}_{technology}_{kpi}".replace(" ", "_")
         model_name = safe_filename(model_name) + ".pkl"
         model_path = os.path.join(MODELS_DIR, model_name)
@@ -334,8 +378,12 @@ def forecast():
             logger.info("Model loaded: %s", model_path)
         except Exception as e:
             logger.exception("Failed to load model")
-            return jsonify({"error": f"Failed to load model: {e}"}), 500
+            payload = {"error": f"Failed to load model: {e}"}
+            if DEBUG:
+                payload["traceback"] = traceback.format_exc()
+            return jsonify(payload), 500
 
+        # Forecast - expecting Prophet-like interface
         try:
             future = model.make_future_dataframe(periods=forecast_months, freq='MS')
             forecast_df = model.predict(future)
@@ -344,11 +392,22 @@ def forecast():
             return jsonify({"error": "Model does not support Prophet API (make_future_dataframe/predict)."}), 500
         except Exception as e:
             logger.exception("Prediction failed")
-            return jsonify({"error": f"Prediction failed: {e}"}), 500
+            payload = {"error": f"Prediction failed: {e}"}
+            if DEBUG:
+                payload["traceback"] = traceback.format_exc()
+            return jsonify(payload), 500
 
-        last_actual = hist_df["Month"].max()
-        actuals = hist_df[hist_df["Month"] <= last_actual].sort_values("Month")
-        forecast_rows = forecast_df[forecast_df["ds"] > last_actual].sort_values("ds")
+        # Prepare response
+        try:
+            last_actual = hist_df["Month"].max()
+            actuals = hist_df[hist_df["Month"] <= last_actual].sort_values("Month")
+            forecast_rows = forecast_df[forecast_df["ds"] > last_actual].sort_values("ds")
+        except Exception as e:
+            logger.exception("Failed preparing response slices")
+            payload = {"error": f"Failed preparing response: {e}"}
+            if DEBUG:
+                payload["traceback"] = traceback.format_exc()
+            return jsonify(payload), 500
 
         response = {
             "actual": {
@@ -373,4 +432,5 @@ def forecast():
 # Run
 # -----------------------
 if __name__ == "__main__":
+    # For local testing only. On Render the WSGI server is used.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=DEBUG)
