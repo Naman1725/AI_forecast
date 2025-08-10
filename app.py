@@ -1,3 +1,4 @@
+"""
 from flask import Flask, request, jsonify
 import pandas as pd
 import requests
@@ -115,3 +116,80 @@ def forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+"""
+from flask import Flask, request, jsonify
+import pandas as pd
+import requests
+from io import BytesIO
+from prophet import Prophet
+from datetime import timedelta
+import os
+import zipfile
+
+app = Flask(__name__)
+
+# -------- CONFIG --------
+# Excel file from GitHub raw link
+EXCEL_URL = "https://raw.githubusercontent.com/yourusername/yourrepo/main/data.xlsx"
+# Models ZIP file from GitHub raw link
+MODELS_ZIP_URL = "https://raw.githubusercontent.com/yourusername/yourrepo/main/models.zip"
+
+# -------- DATA LOADING --------
+def load_excel():
+    """Load Excel file from GitHub."""
+    try:
+        resp = requests.get(EXCEL_URL)
+        resp.raise_for_status()
+        return pd.read_excel(BytesIO(resp.content))
+    except Exception as e:
+        raise RuntimeError(f"Error loading Excel file: {e}")
+
+def extract_models():
+    """Download and extract models from ZIP."""
+    try:
+        resp = requests.get(MODELS_ZIP_URL)
+        resp.raise_for_status()
+        with zipfile.ZipFile(BytesIO(resp.content), 'r') as zip_ref:
+            zip_ref.extractall("models")
+    except Exception as e:
+        raise RuntimeError(f"Error extracting models: {e}")
+
+# -------- FORECAST FUNCTION --------
+def run_forecast(df, country, kpi, periods):
+    """Run Prophet forecast for a given country & KPI."""
+    try:
+        df_filtered = df[(df["Country"] == country) & (df["KPI"] == kpi)].copy()
+        if df_filtered.empty:
+            return {"error": "No matching data found"}
+
+        df_filtered.rename(columns={"Date": "ds", "Value": "y"}, inplace=True)
+        model = Prophet()
+        model.fit(df_filtered)
+        future = model.make_future_dataframe(periods=periods, freq="M")
+        forecast = model.predict(future)
+        return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(periods).to_dict(orient="records")
+    except Exception as e:
+        return {"error": str(e)}
+
+# -------- API ROUTES --------
+@app.route("/forecast", methods=["POST"])
+def forecast_api():
+    data = request.get_json()
+    if not data or not all(k in data for k in ("country", "kpi", "periods")):
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    country = data["country"]
+    kpi = data["kpi"]
+    periods = int(data["periods"])
+
+    df = load_excel()
+    result = run_forecast(df, country, kpi, periods)
+    return jsonify(result)
+
+# -------- APP START --------
+if __name__ == "__main__":
+    # Extract models on startup
+    extract_models()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
