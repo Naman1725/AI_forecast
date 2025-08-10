@@ -48,7 +48,7 @@ def load_excel():
         # Immediately normalize column types to strings for consistent handling
         df.columns = [str(c) for c in df.columns]
         logger.debug("Excel loaded, shape=%s", df.shape)
-        logger.debug("Excel columns (first 100): %s", df.columns.tolist()[:100])
+        logger.debug("Excel columns (first 200): %s", df.columns.tolist()[:200])
         return df
     except Exception as e:
         logger.exception("Failed to download/load excel")
@@ -146,10 +146,8 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     df = df.copy()
     logger.debug("convert_to_long_format called with df.shape=%s", df.shape)
 
-    # 1) Normalize column names to strings
+    # Normalize and dedupe column names
     df.columns = [str(c) for c in df.columns]
-
-    # 2) Deduplicate duplicate column labels (Month duplicates were causing issues)
     cols = list(df.columns)
     if any(pd.Index(cols).duplicated()):
         logger.warning("Duplicate column labels detected before dedup: %s", cols)
@@ -165,7 +163,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
                 new_name = name
             new_cols.append(new_name)
         df.columns = new_cols
-        logger.info("Renamed duplicate columns. New columns (first 100): %s", df.columns.tolist()[:100])
+        logger.info("Renamed duplicate columns. New columns (first 200): %s", df.columns.tolist()[:200])
 
     # If already in long format with Month + Value, try to filter and return
     if {"Month", "Value"}.issubset(set(df.columns)):
@@ -207,7 +205,6 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
             logger.debug("Returning long-format result shape=%s", result.shape)
             return result[["Month", "Value"]]
 
-    # If columns are a MultiIndex or look like tuples, flatten them (they were already stringified above)
     # Detect month-like columns
     month_cols = detect_month_columns(df.columns)
     logger.debug("Detected month columns: %s", month_cols)
@@ -222,7 +219,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     if not month_cols:
         raise ValueError(
             "Could not detect monthly columns in the Excel file. "
-            "Column names found: " + ", ".join([str(c) for c in df.columns[:100]])
+            "Column names found: " + ", ".join([str(c) for c in df.columns[:200]])
         )
 
     id_vars = [c for c in df.columns if c not in month_cols]
@@ -261,7 +258,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     if kpi_col:
         melted = melted[melted[kpi_col].astype(str).apply(_normalize_str) == _normalize_str(kpi)]
 
-    # Convert Month to datetime
+    # Convert Month to datetime into a dedicated column, but DO NOT overwrite the original 'Month' string column
     melted["Month_parsed"] = pd.to_datetime(melted["Month"], errors="coerce", dayfirst=False)
     if melted["Month_parsed"].isna().all():
         # try some common formats
@@ -279,8 +276,11 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
         melted["Month_parsed"] = melted["Month"].apply(try_parse)
 
     melted["Value"] = pd.to_numeric(melted["Value"], errors="coerce")
-    result = melted.dropna(subset=["Month_parsed", "Value"]).rename(columns={"Month_parsed": "Month"})
-    result = result[["Month", "Value"]].sort_values("Month").reset_index(drop=True)
+
+    # IMPORTANT: build the final result from Month_parsed only so we never end up with duplicate 'Month' labels
+    result = melted.loc[:, ["Month_parsed", "Value"]].rename(columns={"Month_parsed": "Month"})
+    result = result.dropna(subset=["Month", "Value"]).sort_values("Month").reset_index(drop=True)
+
     logger.debug("convert_to_long_format returning shape=%s", result.shape)
     return result
 
