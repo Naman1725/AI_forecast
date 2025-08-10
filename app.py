@@ -380,7 +380,7 @@ def forecast():
         model_name = f"{country}_{zone_str}_{technology}_{kpi}"
         model_name = safe_filename(model_name) + ".pkl"
 
-        model_name = safe_filename(model_name) + ".pkl"
+       
         model_path = os.path.join(MODELS_DIR, model_name)
         logger.debug("Looking for model at: %s", model_path)
 
