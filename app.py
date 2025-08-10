@@ -6,6 +6,7 @@ import zipfile
 import joblib
 from prophet import Prophet
 import os
+import re
 
 app = Flask(__name__)
 
@@ -18,14 +19,10 @@ MODELS_ZIP_PATH = "kpi_models.zip"
 MODELS_DIR = "kpi_models"
 
 def load_excel():
-    """Load historical KPI data from GitHub with robust column handling."""
+    """Load historical KPI data from GitHub."""
     response = requests.get(EXCEL_URL)
     response.raise_for_status()
-    
-    # Load Excel and clean column names
-    df = pd.read_excel(BytesIO(response.content))
-    df.columns = [col.strip().lower() for col in df.columns]
-    return df
+    return pd.read_excel(BytesIO(response.content))
 
 def ensure_models_unzipped():
     """Download and unzip models if not already extracted."""
@@ -37,10 +34,39 @@ def ensure_models_unzipped():
         with zipfile.ZipFile(MODELS_ZIP_PATH, "r") as zip_ref:
             zip_ref.extractall(MODELS_DIR)
 
+def convert_to_long_format(df, country, technology, zone, kpi):
+    """Convert wide format data to long format with Month and Value columns."""
+    # Filter the specific row
+    filtered = df[
+        (df["Country"].str.strip().str.lower() == country.strip().lower()) &
+        (df["Technology"].str.strip().str.lower() == technology.strip().lower()) &
+        (df["Zone"].str.strip().str.lower() == zone.strip().lower()) &
+        (df["KPI"].str.strip().str.lower() == kpi.strip().lower())
+    ]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Get month columns (all columns after 'Threshold')
+    month_columns = [col for col in filtered.columns if re.match(r"[A-Za-z]{3}-\d{4}", str(col))]
+    
+    # Melt to long format
+    long_df = filtered.melt(
+        id_vars=["Country", "Technology", "Zone", "KPI"],
+        value_vars=month_columns,
+        var_name="Month",
+        value_name="Value"
+    )
+    
+    # Convert month strings to datetime
+    long_df["Month"] = pd.to_datetime(long_df["Month"], format="%b-%Y")
+    
+    return long_df[["Month", "Value"]].sort_values("Month")
+
 @app.route("/forecast", methods=["POST"])
 def forecast():
     try:
-        # Get parameters
+        # Get parameters from form-data
         country = request.form.get("country")
         technology = request.form.get("technology")
         zone = request.form.get("zone")
@@ -50,45 +76,27 @@ def forecast():
         if not all([country, technology, zone, kpi]):
             return jsonify({"error": "Missing required parameters"}), 400
 
-        # Load and clean data
+        # Load data
         df = load_excel()
         
-        # Check for required columns
-        required_cols = ['country', 'technology', 'zone', 'kpi', 'month', 'value']
-        missing = [col for col in required_cols if col not in df.columns]
-        if missing:
-            return jsonify({
-                "error": f"Missing columns in data: {missing}",
-                "available_columns": list(df.columns)
-            }), 500
-
-        # Filter historical data
-        hist_df = df[
-            (df["country"].str.strip().str.lower() == country.strip().lower()) &
-            (df["technology"].str.strip().str.lower() == technology.strip().lower()) &
-            (df["zone"].str.strip().str.lower() == zone.strip().lower()) &
-            (df["kpi"].str.strip().str.lower() == kpi.strip().lower())
-        ][["month", "value"]]
-
+        # Convert to long format
+        hist_df = convert_to_long_format(df, country, technology, zone, kpi)
+        
         if hist_df.empty:
             return jsonify({"error": "No data found for given parameters"}), 404
-
-        # Prepare historical data
-        hist_df["month"] = pd.to_datetime(hist_df["month"])
-        hist_df = hist_df.sort_values("month")
 
         # Ensure models extracted
         ensure_models_unzipped()
 
         # Build model filename
         safe_kpi = kpi.replace(" ", "_").replace("/", "_").replace("—", "_").replace("(", "").replace(")", "")
-        model_filename = f"{country}_{zone}_{technology}_{safe_kpi}.pkl".lower()
+        model_filename = f"{country}_{zone}_{technology}_{safe_kpi}.pkl".replace(" ", "_")
         model_path = os.path.join(MODELS_DIR, model_filename)
 
         if not os.path.exists(model_path):
             return jsonify({
                 "error": f"Model file not found: {model_filename}",
-                "available_models": os.listdir(MODELS_DIR)
+                "available_models": os.listdir(MODELS_DIR) if os.path.exists(MODELS_DIR) else []
             }), 404
 
         # Load model
@@ -99,25 +107,29 @@ def forecast():
         forecast_df = model.predict(future)
 
         # Prepare output
-        last_actual_date = hist_df["month"].max()
-        actual_data = hist_df[hist_df["month"] <= last_actual_date]
+        last_actual_date = hist_df["Month"].max()
+        actual_data = hist_df[hist_df["Month"] <= last_actual_date]
         forecast_data = forecast_df[forecast_df["ds"] > last_actual_date][["ds", "yhat"]]
 
         return jsonify({
             "actual": {
-                "x": actual_data["month"].dt.strftime("%Y-%m-%d").tolist(),
-                "y": actual_data["value"].round(2).tolist(),
+                "x": actual_data["Month"].dt.strftime("%Y-%m-%d").tolist(),
+                "y": actual_data["Value"].tolist(),
                 "name": "Actual"
             },
             "forecast": {
                 "x": forecast_data["ds"].dt.strftime("%Y-%m-%d").tolist(),
-                "y": forecast_data["yhat"].round(2).tolist(),
+                "y": forecast_data["yhat"].tolist(),
                 "name": "Forecast"
             }
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
