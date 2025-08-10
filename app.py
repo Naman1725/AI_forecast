@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 # URLs for GitHub raw files
 EXCEL_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/data.xlsx"
-MODELS_ZIP_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/kpi_models.zip"
+MODELS_ZIP_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/models"
 
 # Temp paths
 MODELS_ZIP_PATH = "kpi_models.zip"
