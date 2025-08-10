@@ -19,7 +19,7 @@ from flask import Flask, request, jsonify
 EXCEL_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/data.xlsx"
 MODELS_ZIP_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/kpl_models.zip"
 MODELS_ZIP_PATH = "kpl_models.zip"
-MODELS_DIR = "kpi_models"
+MODELS_DIR = "models"  # <-- changed to use your uploaded unzipped models folder
 
 DEBUG = os.environ.get("DEBUG", "1") == "1"
 
@@ -55,23 +55,41 @@ def load_excel():
         raise RuntimeError(f"Failed to download/load excel: {e}")
 
 def ensure_models_unzipped():
-    """Download and extract models if MODELS_DIR doesn't exist or is empty"""
-    if os.path.exists(MODELS_DIR) and os.listdir(MODELS_DIR):
-        logger.debug("Models directory already exists and non-empty: %s", MODELS_DIR)
-        return
+    """
+    Use the MODELS_DIR (now set to 'models') if present.
+    Only attempt download/extract if no local directory is found.
+    """
+    global MODELS_DIR
 
-    logger.info("Models directory missing or empty. Downloading models zip...")
+    # Look for common local model directories first
+    candidates = [MODELS_DIR, "kpi_models", "kpl_models"]
+    for cand in candidates:
+        if cand and os.path.exists(cand) and os.listdir(cand):
+            if cand != MODELS_DIR:
+                logger.info("Found existing models directory '%s'. Using it instead of '%s'.", cand, MODELS_DIR)
+                MODELS_DIR = cand
+            else:
+                logger.debug("Using models directory: %s", MODELS_DIR)
+            return
+
+    # No local folder found -> attempt download (fallback)
+    logger.info("No local models folder found. Attempting to download models zip from %s", MODELS_ZIP_URL)
     try:
         r = requests.get(MODELS_ZIP_URL, timeout=60)
         r.raise_for_status()
     except Exception as e:
         logger.exception("Failed to download models zip")
+        # re-check local dirs once more before bailing
+        for cand in candidates:
+            if cand and os.path.exists(cand) and os.listdir(cand):
+                logger.info("After failed download, found local models dir '%s'. Using it.", cand)
+                MODELS_DIR = cand
+                return
         raise RuntimeError(f"Failed to download models zip: {e}")
 
+    # Write zip and extract
     with open(MODELS_ZIP_PATH, "wb") as f:
         f.write(r.content)
-    logger.debug("Models zip written to %s", MODELS_ZIP_PATH)
-
     temp_dir = "temp_models"
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
@@ -86,15 +104,11 @@ def ensure_models_unzipped():
         for e in entries:
             full = os.path.join(temp_dir, e)
             if os.path.isdir(full):
-                # prefer directory named 'models'
                 if e.lower() == "models":
                     candidate = full
                     break
                 candidate = full if candidate is None else candidate
-
-        # If zip contained files directly, candidate will be None and src=temp_dir
         src = candidate or temp_dir
-
         if os.path.exists(MODELS_DIR):
             shutil.rmtree(MODELS_DIR)
         shutil.move(src, MODELS_DIR)
@@ -103,7 +117,6 @@ def ensure_models_unzipped():
         logger.exception("Failed to extract/move models")
         raise RuntimeError(f"Failed to extract/move models: {e}")
     finally:
-        # cleanup
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
@@ -356,7 +369,7 @@ def forecast():
         if hist_df.empty:
             return jsonify({"error": "No historical data found for the given parameters"}), 404
 
-        # Ensure models available
+        # Ensure models available (will use MODELS_DIR = "models" you uploaded)
         ensure_models_unzipped()
 
         # Build model filename and load
