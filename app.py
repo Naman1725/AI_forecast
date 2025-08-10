@@ -35,8 +35,9 @@ app = Flask(__name__)
 # Helpers
 # -----------------------
 def safe_filename(s: str) -> str:
-    """Create filesystem-safe filenames"""
-    return re.sub(r'[^a-zA-Z0-9_]', '', s.replace(" ", "_"))
+    """Create filesystem-safe filenames, preserving spaces in zone names until join step"""
+    return re.sub(r'[^a-zA-Z0-9_ ]', '', s)  # allow spaces temporarily
+
 
 def load_excel():
     """Download the excel file and return a pandas DataFrame"""
@@ -373,7 +374,12 @@ def forecast():
         ensure_models_unzipped()
 
         # Build model filename and load
-        model_name = f"{country} {zone}_{technology}_{kpi}".replace(" ", "_")
+        
+        # Instead of replacing all spaces blindly, build manually
+        zone_str = zone  # keep the space between Zone and number intact
+        model_name = f"{country}_{zone_str}_{technology}_{kpi}"
+        model_name = safe_filename(model_name) + ".pkl"
+
         model_name = safe_filename(model_name) + ".pkl"
         model_path = os.path.join(MODELS_DIR, model_name)
         logger.debug("Looking for model at: %s", model_path)
