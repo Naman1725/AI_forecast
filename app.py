@@ -1,4 +1,3 @@
-
 # app.py
 import os
 import re
@@ -28,16 +27,16 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
-app = Flask(_name_)
+app = Flask(__name__)
 
 # -----------------------
 # Helpers
 # -----------------------
 def safe_filename(s: str) -> str:
-    """Create filesystem-safe filenames, preserving spaces in zone names until join step"""
-    return re.sub(r'[^a-zA-Z0-9_ ]', '', s)  # allow spaces temporarily
+    """Create filesystem-safe filenames while preserving underscores and spaces"""
+    return re.sub(r'[^a-zA-Z0-9_ ]', '', s)  # allow spaces and underscores
 
 
 def load_excel():
@@ -271,7 +270,7 @@ def convert_to_long_format(df: pd.DataFrame, country: str, technology: str, zone
     if tech_col:
         melted = melted[melted[tech_col].astype(str).apply(_normalize_str) == _normalize_str(technology)]
     if kpi_col:
-        melted = melted[melted[kpi_col].astype(str).apply(_normalize_str) == _normalize_str(kpi)]
+        melted = melted[melted[kpi_col].astize(str).apply(_normalize_str) == _normalize_str(kpi)]
 
     # Convert Month to datetime into a dedicated column, but DO NOT overwrite the original 'Month' string column
     melted["Month_parsed"] = pd.to_datetime(melted["Month"], errors="coerce", dayfirst=False)
@@ -374,24 +373,37 @@ def forecast():
         # Ensure models available (will use MODELS_DIR = "models" you uploaded)
         ensure_models_unzipped()
 
-        # Build model filename and load
+        # Build model filename - FIXED MODEL NAME FORMATTING
+        # Standardize KPI formatting by replacing spaces with underscores
+        kpi_clean = kpi.replace(" ", "_")
+        # Create safe filename with consistent structure
+        base_name = f"{country}_{zone}_{technology}_{kpi_clean}"
+        safe_base = safe_filename(base_name)
+        model_name = f"{safe_base}.pkl"
         
-        # Instead of replacing all spaces blindly, build manually
-        zone_str = zone  # keep the space between Zone and number intact
-        model_name = f"{country}{zone_str}{technology}_{kpi}"
-        model_name = safe_filename(model_name) + ".pkl"
-
-       
         model_path = os.path.join(MODELS_DIR, model_name)
         logger.debug("Looking for model at: %s", model_path)
 
         if not os.path.exists(model_path):
-            available = os.listdir(MODELS_DIR) if os.path.exists(MODELS_DIR) else []
-            logger.error("Model not found: %s", model_name)
-            return jsonify({
-                "error": f"Model not found: {model_name}",
-                "available_models": available
-            }), 404
+            # Try alternative model name formats
+            alt_model_name1 = f"{country}_{zone}_{technology}_{kpi.replace(' ', '_')}.pkl"
+            alt_model_name2 = f"{country}_{zone}_{technology}_{safe_filename(kpi)}.pkl"
+            
+            # Try the alternative names
+            if os.path.exists(os.path.join(MODELS_DIR, alt_model_name1)):
+                model_path = os.path.join(MODELS_DIR, alt_model_name1)
+                logger.info("Using alternative model name: %s", alt_model_name1)
+            elif os.path.exists(os.path.join(MODELS_DIR, alt_model_name2)):
+                model_path = os.path.join(MODELS_DIR, alt_model_name2)
+                logger.info("Using alternative model name: %s", alt_model_name2)
+            else:
+                available = os.listdir(MODELS_DIR) if os.path.exists(MODELS_DIR) else []
+                logger.error("Model not found: %s", model_name)
+                return jsonify({
+                    "error": f"Model not found: {model_name}",
+                    "attempted_names": [model_name, alt_model_name1, alt_model_name2],
+                    "available_models": available
+                }), 404
 
         try:
             model = joblib.load(model_path)
@@ -443,7 +455,7 @@ def forecast():
 
     except Exception as e:
         logger.exception("Unhandled error in /forecast")
-        payload = {"error_type": type(e)._name_, "error": str(e)}
+        payload = {"error_type": type(e).__name__, "error": str(e)}
         if DEBUG:
             payload["traceback"] = traceback.format_exc()
         return jsonify(payload), 500
@@ -451,8 +463,6 @@ def forecast():
 # -----------------------
 # Run
 # -----------------------
-if _name_ == "_main_":
+if __name__ == "__main__":
     # For local testing only. On Render the WSGI server is used.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=DEBUG)
-
-
