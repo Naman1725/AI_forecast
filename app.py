@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 EXCEL_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/data.xlsx"
 MODELS_ZIP_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/kpl_models.zip"
 MODELS_ZIP_PATH = "kpl_models.zip"
-MODELS_DIR = "models"
+MODELS_DIR = "models2"
 
 DEBUG = os.environ.get("DEBUG", "1") == "1"
 
