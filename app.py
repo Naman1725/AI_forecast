@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import shutil
@@ -19,7 +18,7 @@ from flask import Flask, request, jsonify
 EXCEL_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/data.xlsx"
 MODELS_ZIP_URL = "https://raw.githubusercontent.com/Naman1725/AI_forecast/main/kpl_models.zip"
 MODELS_ZIP_PATH = "kpl_models.zip"
-MODELS_DIR = "models"  # <-- changed to use your uploaded unzipped models folder
+MODELS_DIR = "models"
 
 DEBUG = os.environ.get("DEBUG", "1") == "1"
 
@@ -34,19 +33,20 @@ app = Flask(__name__)
 # -----------------------
 # Helpers
 # -----------------------
+
 def safe_filename(s: str) -> str:
     """Create filesystem-safe filenames, preserving spaces in zone names until join step"""
-    return re.sub(r'[^a-zA-Z0-9_ ]', '', s)  # allow spaces temporarily
-
+    # Allow spaces temporarily; do NOT remove them here to keep zone numbers separated
+    return re.sub(r'[^a-zA-Z0-9_ ]', '', s)
 
 def load_excel():
-    """Download the excel file and return a pandas DataFrame"""
+    """Download the Excel file and return a pandas DataFrame"""
     try:
         logger.debug("Downloading Excel from: %s", EXCEL_URL)
         resp = requests.get(EXCEL_URL, timeout=30)
         resp.raise_for_status()
         df = pd.read_excel(BytesIO(resp.content))
-        df.columns = [str(c) for c in df.columns]  # normalize column types
+        df.columns = [str(c) for c in df.columns]
         logger.debug("Excel loaded, shape=%s", df.shape)
         return df
     except Exception as e:
@@ -54,17 +54,16 @@ def load_excel():
         raise RuntimeError(f"Failed to download/load excel: {e}")
 
 def ensure_models_unzipped():
-    """Ensure models are available locally, download/unzip if needed"""
     global MODELS_DIR
     candidates = [MODELS_DIR, "kpi_models", "kpl_models"]
     for cand in candidates:
         if cand and os.path.exists(cand) and os.listdir(cand):
             if cand != MODELS_DIR:
-                logger.info("Found existing models directory '%s'. Using it.", cand)
+                logger.info(f"Found existing models directory '{cand}'. Using it instead of '{MODELS_DIR}'.")
                 MODELS_DIR = cand
             return
 
-    logger.info("No local models folder found. Attempting to download models zip from %s", MODELS_ZIP_URL)
+    logger.info(f"No local models folder found. Attempting to download models zip from {MODELS_ZIP_URL}")
     try:
         r = requests.get(MODELS_ZIP_URL, timeout=60)
         r.raise_for_status()
@@ -72,7 +71,7 @@ def ensure_models_unzipped():
         logger.exception("Failed to download models zip")
         for cand in candidates:
             if cand and os.path.exists(cand) and os.listdir(cand):
-                logger.info("After failed download, found local models dir '%s'. Using it.", cand)
+                logger.info(f"After failed download, found local models dir '{cand}'. Using it.")
                 MODELS_DIR = cand
                 return
         raise RuntimeError(f"Failed to download models zip: {e}")
@@ -102,7 +101,7 @@ def ensure_models_unzipped():
         if os.path.exists(MODELS_DIR):
             shutil.rmtree(MODELS_DIR)
         shutil.move(src, MODELS_DIR)
-        logger.info("Models moved to %s", MODELS_DIR)
+        logger.info(f"Models moved to {MODELS_DIR}")
     except Exception as e:
         logger.exception("Failed to extract/move models")
         raise RuntimeError(f"Failed to extract/move models: {e}")
@@ -230,6 +229,32 @@ def validate_hist_df(hist_df):
         hist_df["Value"] = pd.to_numeric(hist_df["Value"])
     return hist_df
 
+# --- New robust model matching helper ---
+def normalize_model_name(name: str) -> str:
+    """
+    Normalize a model name for matching:
+    lowercase, spaces and underscores replaced by empty string,
+    so "France_Zone 1_3G_Availability.pkl" -> "francezone13gavailabilitypkl"
+    """
+    return re.sub(r"[\s_]+", "", name.lower())
+
+def find_best_model(requested_name: str, available: list[str]) -> str | None:
+    """
+    Find the closest model file match ignoring underscores/spaces and case.
+    """
+    norm_req = normalize_model_name(requested_name)
+    for model in available:
+        norm_model = normalize_model_name(model)
+        if norm_req == norm_model:
+            return model
+    return None
+
+def nice_model_name(filename: str) -> str:
+    """Convert filename to a nicer display name, replace underscores with spaces and remove .pkl"""
+    name = filename.replace(".pkl", "")
+    name = name.replace("_", " ")
+    return name
+
 # -----------------------
 # Routes
 # -----------------------
@@ -274,15 +299,23 @@ def forecast():
             return jsonify({"error": "No historical data found"}), 404
 
         ensure_models_unzipped()
-        zone_str = zone
-        model_name = safe_filename(f"{country}{zone_str}{technology}_{kpi}") + ".pkl"
-        model_path = os.path.join(MODELS_DIR, model_name)
-        logger.debug("Looking for model at: %s", model_path)
 
-        if not os.path.exists(model_path):
-            available = os.listdir(MODELS_DIR) if os.path.exists(MODELS_DIR) else []
-            return jsonify({"error": f"Model not found: {model_name}", "available_models": available}), 404
+        # Build requested model name with spaces kept in zone, exactly as the file naming pattern is
+        requested_model_name = f"{country}_{zone}_{technology}_{kpi}.pkl"
+        logger.debug(f"Requested model name: {requested_model_name}")
 
+        # Find the best match ignoring underscore/space/case differences
+        available = os.listdir(MODELS_DIR) if os.path.exists(MODELS_DIR) else []
+        model_filename = find_best_model(requested_model_name, available)
+
+        if not model_filename:
+            return jsonify({
+                "error": f"Model not found: {requested_model_name}",
+                "available_models": available
+            }), 404
+
+        model_path = os.path.join(MODELS_DIR, model_filename)
+        logger.debug(f"Loading model file: {model_path}")
         try:
             model = joblib.load(model_path)
         except Exception as e:
@@ -305,6 +338,7 @@ def forecast():
         forecast_rows = forecast_df[forecast_df["ds"] > last_actual].sort_values("ds")
 
         response = {
+            "model_name": nice_model_name(model_filename),
             "actual": {
                 "x": actuals["Month"].dt.strftime("%Y-%m-%d").tolist(),
                 "y": actuals["Value"].tolist()
